@@ -1,67 +1,91 @@
 # =========================
 # config
 # =========================
-# 環境・基本設定（.env から OPENAI_API_KEY を読み込む）
 import os
 import re
 from dataclasses import dataclass
 from typing import Optional, List
 
-from dotenv import load_dotenv  # .env 読み込み
-load_dotenv()
-
-import streamlit as st  # ← 追加（先にインポートしてOK）
-# Secrets(Cloud) or .env(ローカル) のどちらでも拾えるようにブリッジ
-if "OPENAI_API_KEY" in st.secrets and not os.getenv("OPENAI_API_KEY"):
-    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+from dotenv import load_dotenv
+load_dotenv()  # ローカルの .env を読む
 
 import streamlit as st
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.schema import SystemMessage, HumanMessage
 from langchain_community.vectorstores import Chroma
 
+# 追加: Chroma をメモリで使うためのクライアント
+import chromadb
+from chromadb.config import Settings
 
-# 基本設定をひとまとめにする
+
 @dataclass
 class Config:
-    app_name: str = "streamlit-llm-app"            # アプリ名（DBパスのスラグ化に使用）
-    model_name: str = "gpt-4o-mini"                # LLMモデル
-    temperature: float = 0.0                       # 出力の多様性
-    embed_model: str = "text-embedding-3-small"    # 埋め込みモデル
-    top_k: int = 3                                 # RAGの取得件数
+    app_name: str = "streamlit-llm-app"
+    model_name: str = "gpt-4o-mini"
+    temperature: float = 0.0
+    embed_model: str = "text-embedding-3-small"
+    top_k: int = 3
 
 
 # =========================
 # utils
 # =========================
 def slugify_ascii(text: str) -> str:
-    """ASCII/slug化（ファイルパス用に安全化）"""
+    """ASCII/slug化（ファイルパス安全化）"""
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return re.sub(r"-+", "-", text).strip("-")
 
 
 def build_llm(cfg: Config) -> ChatOpenAI:
-    """LLMクライアントを生成（依存注入のため分離）"""
+    """LLMクライアントを生成"""
     return ChatOpenAI(model_name=cfg.model_name, temperature=cfg.temperature)
+
+
+def resolve_api_key_or_error() -> Optional[str]:
+    """ENV→Secretsの順でAPIキーを取得し、見つかればENVにも注入"""
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        key = st.secrets.get("OPENAI_API_KEY")  # Secrets の TOML が壊れていると例外
+    except Exception:
+        st.error(
+            "Streamlit Secrets の構文（TOML）が不正です。次の形式に直してください：\n\n"
+            '```\nOPENAI_API_KEY = "sk-xxxxxxxx"\n```'
+        )
+        return None
+    if key:
+        os.environ["OPENAI_API_KEY"] = key
+        return key
+    return None
 
 
 # =========================
 # stores
 # =========================
 def build_vectorstore(cfg: Config) -> Chroma:
-    """Chroma(0.4+)で軽量の方針テキストを格納（persist()不要）"""
-    # persona方針（最小の知識ベース）
+    """Chroma をエフェメラル（メモリ）で初期化し、軽量の方針テキストを格納"""
     texts = [
-        "persona:A 方針: あなたは日本の労務・就業規則の一般的な助言者。法令の最終判断は一次情報や専門家確認を促す。個別の法的助言は避け、実務チェックリストや相談先を提案する。",
-        "persona:B 方針: あなたはPython/生成AIの業務改善エンジニア。小さく作って検証、ログと再現性を重視し、APIキー管理とセキュリティに配慮した手順を簡潔に示す。",
+        "persona:A 方針: あなたは日本の労務・就業規則の一般的な助言者。一次情報の確認を促し、個別の法的助言は避け、実務チェックリストや相談先を提案する。",
+        "persona:B 方針: あなたはPython/生成AIの業務改善エンジニア。小さく作って検証、再現性とセキュリティ、APIキー管理に配慮し、簡潔な手順を示す。",
     ]
     metadatas = [{"persona": "A"}, {"persona": "B"}]
-
     embeddings = OpenAIEmbeddings(model=cfg.embed_model)
-    persist_dir = f".chroma-{slugify_ascii(cfg.app_name)}"  # DBパスはASCII/slug化
-    # ここでは簡便に毎回 from_texts で作成（課題要件上OK）
-    vs = Chroma.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas, persist_directory=persist_dir)
+
+    # ★ここがポイント：永続化を使わず、SQLite 依存を避ける
+    client = chromadb.EphemeralClient(
+        Settings(is_persistent=False, anonymized_telemetry=False)
+    )
+    # persist_directory を渡さない & client を明示
+    vs = Chroma.from_texts(
+        texts=texts,
+        embedding=embeddings,
+        metadatas=metadatas,
+        client=client,
+        collection_name=f"persona-{slugify_ascii(cfg.app_name)}",
+    )
     return vs
 
 
@@ -135,7 +159,7 @@ def generate_response(
     except Exception as e:
         msg = str(e)
         if "OPENAI_API_KEY" in msg or "api key" in msg.lower():
-            return "OpenAI APIキーの問題が発生しました。.env の OPENAI_API_KEY を確認してください。"
+            return "OpenAI APIキーの問題が発生しました。.env または Secrets を確認してください。"
         if "rate limit" in msg.lower():
             return "レート制限に達しました。しばらく待ってから再実行してください。"
         if "timeout" in msg.lower():
@@ -158,31 +182,24 @@ def run_app():
             "- 入力フォームは1つです。\n"
             "- ラジオで **専門家タイプ** を選択（A: 労務アドバイザー / B: 業務改善エンジニア）。\n"
             "- 選択に応じて System メッセージを切り替え、LLMに投げます。\n"
-            "- APIキーは `.env` の `OPENAI_API_KEY` を使用します（GitHubへは含めない）。"
+            "- ローカルは `.env`、Cloudは **Secrets** に `OPENAI_API_KEY` を設定してください。"
         )
 
-#    if not os.getenv("OPENAI_API_KEY"):
-#        st.error("OPENAI_API_KEY が環境変数に見つかりません。.env を確認してください。")
-#        st.stop()
-
-    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    # APIキー解決（ENV or Secrets）
+    api_key = resolve_api_key_or_error()
     if not api_key:
-        st.error("OPENAI_API_KEY が未設定です。Cloudでは『App settings → Secrets』にキーを保存してください。")
         st.stop()
-    # 念のため環境変数へも流し込む
-    os.environ["OPENAI_API_KEY"] = api_key
-
 
     cfg = Config()
     try:
-        llm = build_llm(cfg)  # LLM初期化
+        llm = build_llm(cfg)
     except Exception as e:
         st.error(f"LLM初期化でエラー: {e}")
         st.stop()
 
     retriever = None
     try:
-        retriever = build_retriever(cfg)  # 軽量RAG
+        retriever = build_retriever(cfg)  # ★メモリChromaで初期化（SQLite依存なし）
     except Exception as e:
         st.warning(f"知識ベース初期化に失敗しました（RAGなしで継続）: {e}")
 
@@ -203,4 +220,4 @@ def run_app():
 # main（Streamlitエントリポイント）
 # =========================
 if __name__ == "__main__":
-    run_app()  # Streamlitで起動した際にUIを描画
+    run_app()
