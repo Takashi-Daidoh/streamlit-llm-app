@@ -10,6 +10,11 @@ from typing import Optional, List
 from dotenv import load_dotenv  # .env 読み込み
 load_dotenv()
 
+import streamlit as st  # ← 追加（先にインポートしてOK）
+# Secrets(Cloud) or .env(ローカル) のどちらでも拾えるようにブリッジ
+if "OPENAI_API_KEY" in st.secrets and not os.getenv("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
 import streamlit as st
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.schema import SystemMessage, HumanMessage
@@ -156,9 +161,17 @@ def run_app():
             "- APIキーは `.env` の `OPENAI_API_KEY` を使用します（GitHubへは含めない）。"
         )
 
-    if not os.getenv("OPENAI_API_KEY"):
-        st.error("OPENAI_API_KEY が環境変数に見つかりません。.env を確認してください。")
+#    if not os.getenv("OPENAI_API_KEY"):
+#        st.error("OPENAI_API_KEY が環境変数に見つかりません。.env を確認してください。")
+#        st.stop()
+
+    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        st.error("OPENAI_API_KEY が未設定です。Cloudでは『App settings → Secrets』にキーを保存してください。")
         st.stop()
+    # 念のため環境変数へも流し込む
+    os.environ["OPENAI_API_KEY"] = api_key
+
 
     cfg = Config()
     try:
