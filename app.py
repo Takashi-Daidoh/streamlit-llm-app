@@ -11,8 +11,8 @@ load_dotenv()  # ローカル .env 読み込み
 
 import streamlit as st
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.schema import SystemMessage, HumanMessage, Document  # Documentはフォールバック用に使用
-
+from langchain_core.messages import SystemMessage, HumanMessage  # v0.2+
+from langchain_core.documents import Document  # フォールバック用
 
 @dataclass
 class Config:
@@ -47,7 +47,7 @@ def resolve_api_key_or_error() -> Optional[str]:
         key = st.secrets.get("OPENAI_API_KEY")  # SecretsのTOML不正だと例外
     except Exception:
         st.error(
-            "Streamlit Secrets の構文（TOML）が不正です。以下の形式に直してください：\n\n"
+            "Streamlit Secrets の構文（TOML）が不正です。以下の1行だけに直してください：\n\n"
             '```\nOPENAI_API_KEY = "sk-xxxxxxxx"\n```'
         )
         return None
@@ -61,7 +61,7 @@ def resolve_api_key_or_error() -> Optional[str]:
 # stores
 # =========================
 class SimpleInMemoryRetriever:
-    """Chromaが使えない環境向けの簡易ベクタ検索（OpenAI埋め込み + コサイン類似度）"""
+    """Chroma不可環境向けの簡易ベクタ検索（OpenAI埋め込み + コサイン類似度）"""
     def __init__(self, texts: List[str], metadatas: List[dict], embeddings: OpenAIEmbeddings, k: int = 3):
         self.embeddings = embeddings
         self.docs = [Document(page_content=t, metadata=m) for t, m in zip(texts, metadatas)]
@@ -69,7 +69,6 @@ class SimpleInMemoryRetriever:
         self.k = k
 
     def _cosine(self, u: List[float], v: List[float]) -> float:
-        # numpyなしのコサイン類似度
         dot = sum(a * b for a, b in zip(u, v))
         nu = sum(a * a for a in u) ** 0.5
         nv = sum(b * b for b in v) ** 0.5
@@ -84,7 +83,7 @@ class SimpleInMemoryRetriever:
 
 
 def build_retriever(cfg: Config):
-    """可能ならChroma(エフェメラル)を使用。ダメならインメモリ検索にフォールバック。"""
+    """可能ならChroma(メモリ)を使用。ダメならインメモリ検索にフォールバック。"""
     texts = [
         "persona:A 方針: あなたは日本の労務・就業規則の一般的な助言者。一次情報の確認を促し、個別の法的助言は避け、実務チェックリストや相談先を提案する。",
         "persona:B 方針: あなたはPython/生成AIの業務改善エンジニア。小さく作って検証、再現性とセキュリティ、APIキー管理に配慮し、簡潔な手順を示す。",
@@ -92,7 +91,7 @@ def build_retriever(cfg: Config):
     metadatas = [{"persona": "A"}, {"persona": "B"}]
     embeddings = OpenAIEmbeddings(model=cfg.embed_model)
 
-    # --- まずChromaを試す（import段階で落ちる可能性があるため関数内でtry） ---
+    # --- ここで初めてChromaを試す（importで落ちる環境を回避） ---
     try:
         import chromadb
         from chromadb.config import Settings
@@ -108,7 +107,6 @@ def build_retriever(cfg: Config):
         )
         return vs.as_retriever(search_kwargs={"k": cfg.top_k})
     except Exception as e:
-        # CloudでSQLiteバージョンが古い等の理由で失敗 → フォールバック
         st.warning(f"Chromaを利用できないため、インメモリ検索にフォールバックします: {e}")
         return SimpleInMemoryRetriever(texts, metadatas, embeddings, k=cfg.top_k)
 
